@@ -703,14 +703,23 @@ def ensure_server(
     # satisfied by the *winner's* /health, so it saved its own key and the
     # running server ended up with a key nobody had.  The symptom was exactly
     # "a server is running but does not accept the stored API key".
+    #
+    # The named mutex extends the same guarantee across processes, so a GUI and
+    # a `qwen35 serve` started at the same moment cannot race either.  If it
+    # cannot be taken we proceed anyway: refusing to start a server because a
+    # lock is busy would be worse than a race that the ownership check below
+    # already catches.
+    from .single_instance import server_start_lock
+
     with _START_LOCK:
-        return _ensure_server_locked(
-            model_dir=model_dir, context=context, port=port, host=host,
-            gguf=gguf, mmproj=mmproj, kv_cache_type=kv_cache_type, mtp=mtp,
-            threads=threads, ctx_checkpoints=ctx_checkpoints,
-            checkpoint_min_step=checkpoint_min_step,
-            force_restart=force_restart, timeout=timeout, state_dir=state_dir,
-            progress=progress)
+        with server_start_lock(timeout=max(timeout, 30.0)):
+            return _ensure_server_locked(
+                model_dir=model_dir, context=context, port=port, host=host,
+                gguf=gguf, mmproj=mmproj, kv_cache_type=kv_cache_type, mtp=mtp,
+                threads=threads, ctx_checkpoints=ctx_checkpoints,
+                checkpoint_min_step=checkpoint_min_step,
+                force_restart=force_restart, timeout=timeout,
+                state_dir=state_dir, progress=progress)
 
 
 def _ensure_server_locked(

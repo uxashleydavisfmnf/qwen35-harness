@@ -1460,6 +1460,128 @@ class TestServerConflictHandling(unittest.TestCase):
         self.assertEqual(order[3][-3:], "out")
 
 
+class TestSingleInstance(unittest.TestCase):
+    """One window at a time, and a lock that survives across processes.
+
+    Two GUI windows shared one port and one server.json, which is how the harness
+    reached "a server is running but does not accept the stored API key".  A
+    second launch must bring the first window forward instead of building a
+    rival.
+    """
+
+    def setUp(self):
+        from qwen35 import single_instance
+
+        self.si = single_instance
+
+    def test_an_os_mutex_is_used_on_windows(self):
+        if not self.si.IS_WINDOWS:
+            self.skipTest("Windows-specific mechanism")
+        lock = self.si.NamedLock(r"Local\qwen35-unit-test-a")
+        self.assertTrue(lock.acquire())
+        lock.release()
+
+    def test_a_second_thread_cannot_take_a_held_lock(self):
+        """A mutex belongs to a thread, so the exclusion shows across threads.
+
+        (Acquiring twice from the *same* thread would succeed -- Windows mutexes
+        are recursive for their owner.  That is correct behaviour, not a bug, but
+        it means a single-threaded test would prove nothing.)
+        """
+        import threading
+
+        lock = self.si.NamedLock(r"Local\qwen35-unit-test-b")
+        self.assertTrue(lock.acquire())
+        seen: list[bool] = []
+
+        def other() -> None:
+            seen.append(self.si.NamedLock(r"Local\qwen35-unit-test-b")
+                        .acquire(timeout=0))
+
+        thread = threading.Thread(target=other)
+        thread.start()
+        thread.join(timeout=10)
+        lock.release()
+        self.assertEqual(seen, [False], "a second thread got a held lock")
+
+    def test_the_lock_is_released_for_the_next_taker(self):
+        first = self.si.NamedLock(r"Local\qwen35-unit-test-c")
+        self.assertTrue(first.acquire())
+        first.release()
+        second = self.si.NamedLock(r"Local\qwen35-unit-test-c")
+        self.assertTrue(second.acquire())
+        second.release()
+
+    def test_a_malformed_name_fails_loudly(self):
+        """Silently returning False would look like 'someone else has it'."""
+        if not self.si.IS_WINDOWS:
+            self.skipTest("Windows-specific mechanism")
+        with self.assertRaises(ValueError):
+            self.si.NamedLock("Local\\\\two-backslashes").acquire()
+
+    def test_finding_a_window_that_does_not_exist(self):
+        self.assertEqual(self.si.find_window("no-such-window-title-xyzzy"), 0)
+        self.assertFalse(self.si.focus_window("no-such-window-title-xyzzy"))
+
+    def test_the_window_title_is_specific(self):
+        """gui.bat's console is titled '... qwen35 GUI' and must not match."""
+        prefix = self.si.WINDOW_TITLE_PREFIX
+        self.assertTrue(self.si.WINDOW_TITLE.startswith(prefix))
+        self.assertFalse("管理员: Administrator:  qwen35 GUI".startswith(prefix),
+                         "the console window would be raised by mistake")
+
+    def test_a_second_gui_does_not_build_a_window(self):
+        """gui.main() must exit early, and raise the first window, when the
+        single-instance lock is already taken.
+
+        The lock is mocked rather than pre-acquired: a Windows mutex is recursive
+        for the thread that owns it, so a test that took the lock first would let
+        main() take it *again* and sail on into mainloop(), which blocks forever.
+        """
+        from qwen35 import gui, single_instance
+
+        focused: list[str] = []
+        original_claim = single_instance.claim_single_instance
+        original_focus = single_instance.focus_window
+        single_instance.claim_single_instance = lambda: None
+        single_instance.focus_window = lambda prefix="": (focused.append(prefix), True)[1]
+        try:
+            code = gui.main(["--no-server", "--no-manage"])
+        finally:
+            single_instance.claim_single_instance = original_claim
+            single_instance.focus_window = original_focus
+        self.assertEqual(code, 0, "the second launch should exit cleanly")
+        self.assertEqual(len(focused), 1, "it should try to raise the first window")
+
+    def test_a_new_instance_flag_bypasses_the_guard(self):
+        """--new-instance must not even ask whether one is open."""
+        from qwen35 import gui, single_instance
+
+        asked: list[bool] = []
+        original_claim = single_instance.claim_single_instance
+        original_make = gui.HarnessGUI
+
+        class Stop(Exception):
+            pass
+
+        def fake_claim():
+            asked.append(True)
+            return None
+
+        def fake_gui(*_a, **_k):
+            raise Stop          # reached the point of building a window
+
+        single_instance.claim_single_instance = fake_claim
+        gui.HarnessGUI = fake_gui
+        try:
+            with self.assertRaises(Stop):
+                gui.main(["--new-instance", "--no-server", "--no-manage"])
+        finally:
+            single_instance.claim_single_instance = original_claim
+            gui.HarnessGUI = original_make
+        self.assertEqual(asked, [], "the guard must be skipped entirely")
+
+
 class TestFailureDiagnosis(unittest.TestCase):
     """A failed run must say what went wrong AND what to do next."""
 

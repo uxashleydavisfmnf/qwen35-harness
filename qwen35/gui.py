@@ -40,6 +40,7 @@ from tkinter import scrolledtext
 from .config import (DEFAULT_PROFILE, PROFILE_CHOICES, PROFILE_TIERS, PROFILES,
                      QWEN35_08B, HarnessConfig, RuntimeConfig,
                      default_model_dir, discover_gguf, get_permissions)
+from .single_instance import WINDOW_TITLE
 from .ingest import (SUPPORTED_EXTENSIONS, Attachment, IngestError,
                      compose_task, ingest_many, inline_budget_for)
 from .llama_runtime import (ServerStatus, ensure_server, load_server_key,
@@ -125,7 +126,7 @@ class HarnessGUI:
 
         self.workspace = self._validate_initial_workspace(workspace)
 
-        root.title("qwen35 - Qwen3.5-0.8B harness")
+        root.title(WINDOW_TITLE)
         root.configure(bg=BG)
         root.geometry("1180x780")
         # The old floor was 880x560, chosen when every row was laid out once and
@@ -1675,7 +1676,28 @@ def main(argv: list[str] | None = None) -> int:
                         help="do not start the model server automatically")
     parser.add_argument("--no-manage", dest="no_manage", action="store_true",
                         help="never stop the server on exit")
+    parser.add_argument("--new-instance", dest="new_instance", action="store_true",
+                        help="open a second window even if one is already running")
     args = parser.parse_args(argv)
+
+    # One window.  A second launch brings the first one forward instead of
+    # building a rival that shares the port and server.json -- which is how the
+    # harness reached "a server is running but does not accept the stored API
+    # key" in the first place.
+    guard = None
+    if not args.new_instance:
+        from .single_instance import (WINDOW_TITLE, claim_single_instance,
+                                      focus_window)
+
+        guard = claim_single_instance()
+        if guard is None:
+            if focus_window(WINDOW_TITLE):
+                print("qwen35 is already open -- brought that window to the front.")
+            else:
+                print("qwen35 is already open, but its window could not be found.")
+                print("  (it may be on another desktop, or minimised to the "
+                      "notification area)")
+            return 0
 
     workspace = args.workspace or (Path.cwd() if _cwd_is_usable() else None)
     if workspace is None:
@@ -1702,7 +1724,11 @@ def main(argv: list[str] | None = None) -> int:
     gui.register_dnd()
     if args.attach:
         gui._add_files([str(Path(p)) for p in args.attach])
-    root.mainloop()
+    try:
+        root.mainloop()
+    finally:
+        if guard is not None:
+            guard.release()
     return 0
 
 
