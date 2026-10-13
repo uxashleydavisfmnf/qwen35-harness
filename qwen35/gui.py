@@ -118,6 +118,8 @@ class HarnessGUI:
         self._closing = False
         self._pump_id: str | None = None
         self._reflow_id: str | None = None
+        #: true while a server start is in flight, so two clicks cannot race
+        self._starting_server = False
         self._pending_paths: list[str] = []
         self._dnd_ready = False
 
@@ -599,15 +601,23 @@ class HarnessGUI:
     # ------------------------------------------------------------------
     # Server
     # ------------------------------------------------------------------
-    def _start_server_async(self) -> None:
+    def _start_server_async(self, force: bool = False) -> None:
+        if self._starting_server:
+            # guard the *start*, not just a running task: two clicks used to
+            # launch two starts at once, and the loser saved a key the winner's
+            # server had never seen
+            self.status_var.set("模型服务正在启动中…")
+            return
         if self._busy:
             return
+        self._starting_server = True
         # Read the Tk variable HERE, on the main thread.  Tk variables are not
         # thread-safe: touching one from the worker raises
         # "RuntimeError: main thread is not in main loop".
         context = int(self.context_var.get())
         self.server_label.configure(text="服务：启动中…", foreground=WARN)
-        self.status_var.set("正在启动模型服务…")
+        self.status_var.set("正在启动模型服务…" + ("（会先停掉占用端口的服务）"
+                                                 if force else ""))
 
         def work() -> None:
             try:
@@ -616,6 +626,7 @@ class HarnessGUI:
                     context=context,
                     port=self.port,
                     state_dir=None,
+                    force_restart=force,
                     progress=lambda m: self.events.put(("server_progress", m, None)),
                 )
             except Exception as exc:  # noqa: BLE001
@@ -631,6 +642,7 @@ class HarnessGUI:
         threading.Thread(target=work, daemon=True, name="qwen35-server").start()
 
     def _on_server_status(self, status: ServerStatus) -> None:
+        self._starting_server = False
         self.server_status = status
         if status.ok:
             verb = "复用" if status.state == "reused" else "就绪"
@@ -1267,10 +1279,16 @@ class HarnessGUI:
                     self._mark_server_down()
                     self._append(f"  端口上有一个服务，但不接受已保存的密钥：{a}\n",
                                  "warn")
-                    self._append(
-                        "  这通常是上一次运行留下的 llama-server。先运行 "
-                        "stop.bat（或 taskkill /IM llama-server.exe）把它停掉，"
-                        "再点「重启服务」。\n", "meta")
+                    # Offer to do the cleanup instead of telling the user to go
+                    # and run taskkill: the harness owns this lifecycle, and
+                    # making them leave the window to fix it is a cop-out.
+                    if messagebox.askyesno(
+                            "端口被占用",
+                            f"{self._base_url()} 上有一个 llama-server，但它不接受"
+                            "已保存的密钥。\n\n"
+                            "这通常是上一次运行留下的进程。\n"
+                            "要停掉它并重新启动模型服务吗？"):
+                        self._start_server_async(force=True)
                 elif kind == "bench_error":
                     self._bench_running = False
                     self._append(f"\n性能实测失败：{a}\n", "err")

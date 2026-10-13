@@ -449,7 +449,9 @@ def cmd_fetch(args: argparse.Namespace) -> int:
 def cmd_serve(args: argparse.Namespace) -> int:
     from .backends.openai_compat import OpenAICompatBackend
     from .llama_runtime import (LlamaServer, build_command, cpu_threads,
-                                installed_server, new_api_key, save_server_key)
+                                installed_server, load_server_key, new_api_key,
+                                port_in_use, probe_server, save_server_key,
+                                stop_servers_on_port)
 
     server = installed_server()
     if not server:
@@ -468,6 +470,30 @@ def cmd_serve(args: argparse.Namespace) -> int:
         return 1
 
     api_key = args.api_key or new_api_key()
+
+    # If something unusable already holds the port, take it back rather than
+    # starting a child that cannot bind and then reporting success because the
+    # *other* server answered the health check.
+    held = port_in_use(args.host, args.port)
+    if held:
+        if not getattr(args, "force_restart", False):
+            state, message = probe_server(f"http://{args.host}:{args.port}",
+                                          load_server_key())
+            print(yellow(f"{args.host}:{args.port} is already in use") +
+                  f" ({message if state != 'up' else 'a server is running'}).")
+            print("  Start it with --force-restart to stop that server and take "
+                  "the port back, or run stop.bat first.")
+            return 1
+        print(yellow(f"stopping whatever holds {args.host}:{args.port}…"))
+        killed = stop_servers_on_port(args.host, args.port)
+        print(dim(f"  stopped {killed} process(es)"))
+        for _ in range(20):
+            if not port_in_use(args.host, args.port):
+                break
+            time.sleep(0.25)
+        if port_in_use(args.host, args.port):
+            print(red(f"{args.host}:{args.port} is still occupied."))
+            return 1
 
     plan = build_command(
         server, weights,
@@ -1109,6 +1135,9 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--mtp-draft-max", dest="mtp_draft_max", type=int, default=6)
     sp.add_argument("--image-min-tokens", dest="image_min_tokens", type=int,
                     default=1024, help="Qwen-VL grounding needs >=1024")
+    sp.add_argument("--force-restart", dest="force_restart", action="store_true",
+                    help="if something unusable already holds the port, stop it "
+                         "and take the port back")
     sp.add_argument("--ctx-checkpoints", dest="ctx_checkpoints", type=int,
                     default=0,
                     help="context checkpoints per slot (default 0 = off). "

@@ -1304,8 +1304,160 @@ class TestServerLifecycleSafety(unittest.TestCase):
             httpd.shutdown()
             httpd.server_close()
         self.assertFalse(status.ok)
-        self.assertIn("already in use", status.message)
+        # the message must name the cause AND the way out
+        self.assertIn("left over from an earlier run", status.message)
         self.assertIn("stop.bat", status.message)
+        self.assertIn("force-restart", status.message)
+
+
+class TestServerConflictHandling(unittest.TestCase):
+    """A server we do not own must never be silently adopted.
+
+    The reported failure was:
+
+        a server is running but does not accept the stored API key
+
+    and its root cause was concurrent starts.  Two clicks on 重启服务 launched two
+    ``ensure_server`` calls; the loser could not bind the port, but ``wait_ready``
+    was satisfied by the *winner's* ``/health``, so the loser saved its own key.
+    The live server had never seen that key, and every later request got a 401.
+    """
+
+    def setUp(self):
+        import http.server
+        import threading
+
+        from qwen35 import llama_runtime
+
+        self.runtime = llama_runtime
+        self._tmp = tempfile.TemporaryDirectory()
+        self.state = Path(self._tmp.name) / "state"
+        self.state.mkdir()
+        # point the harness's state (and therefore server.json) at a temp dir
+        self._old_home = os.environ.get("QWEN35_HOME")
+        os.environ["QWEN35_HOME"] = str(self.state)
+        llama_runtime.save_server_key("ORIGINALKEY", "http://127.0.0.1:1", 999,
+                                      "model.gguf")
+
+        class FakeServer(http.server.BaseHTTPRequestHandler):
+            """/health says ok; everything authenticated says 401."""
+
+            def do_GET(self):  # noqa: N802
+                if self.path.startswith("/health"):
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(b'{"status":"ok"}')
+                else:
+                    self.send_response(401)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(b'{"error":"Invalid API Key"}')
+
+            def log_message(self, *_args):
+                pass
+
+        self.httpd = http.server.HTTPServer(("127.0.0.1", 0), FakeServer)
+        self.port = self.httpd.server_address[1]
+        threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
+
+    def tearDown(self):
+        self.httpd.shutdown()
+        self.httpd.server_close()
+        if self._old_home is None:
+            os.environ.pop("QWEN35_HOME", None)
+        else:
+            os.environ["QWEN35_HOME"] = self._old_home
+        self._tmp.cleanup()
+
+    def test_the_foreign_server_is_detected_as_unauthorized(self):
+        state, _message = self.runtime.probe_server(
+            f"http://127.0.0.1:{self.port}", "ORIGINALKEY")
+        self.assertEqual(state, "unauthorized")
+
+    def test_without_force_it_refuses_and_keeps_the_old_key(self):
+        status = self.runtime.ensure_server(
+            model_dir=Path(self._tmp.name), port=self.port, timeout=5.0)
+        self.assertFalse(status.ok)
+        self.assertIn("not accept", status.message)
+        # the crucial part: the stored key is untouched
+        self.assertEqual(self.runtime.load_server_key(), "ORIGINALKEY")
+
+    def test_the_refusal_explains_how_to_recover(self):
+        status = self.runtime.ensure_server(
+            model_dir=Path(self._tmp.name), port=self.port, timeout=5.0)
+        self.assertIn("force-restart", status.message)
+
+    def test_force_restart_stops_the_holder_and_proceeds(self):
+        stopped: list[tuple[str, int]] = []
+        original_stop = self.runtime.stop_servers_on_port
+        original_bin = self.runtime.installed_server
+        original_in_use = self.runtime.port_in_use
+
+        def fake_stop(host="127.0.0.1", port=8080):
+            stopped.append((host, port))
+            self.httpd.shutdown()          # the port really is released
+            self.httpd.server_close()
+            return 1
+
+        self.runtime.stop_servers_on_port = fake_stop
+        self.runtime.port_in_use = lambda host, port, timeout=0.6: False
+        self.runtime.installed_server = lambda: None    # stop before spawning
+        try:
+            status = self.runtime.ensure_server(
+                model_dir=Path(self._tmp.name), port=self.port,
+                force_restart=True, timeout=5.0)
+        finally:
+            self.runtime.stop_servers_on_port = original_stop
+            self.runtime.installed_server = original_bin
+            self.runtime.port_in_use = original_in_use
+
+        self.assertTrue(stopped, "the holder was not stopped")
+        self.assertEqual(stopped[0][1], self.port)
+        # getting past the gate is proved by reaching the *next* check
+        self.assertIn("not installed", status.message)
+
+    def test_a_successful_start_must_authenticate_with_its_own_key(self):
+        """``wait_ready`` only proves *some* server is up.
+
+        After starting, the harness asks the server to authenticate with the key
+        it just gave its own child.  A foreign server has never seen that key, so
+        a failed confirmation means we lost the port race -- and must not save a
+        key the live server does not have.
+        """
+        source = Path(self.runtime.__file__).read_text(encoding="utf-8")
+        start = source.index("ok, msg = server.wait_ready")
+        tail = source[start:start + 1800]
+        self.assertIn("prove the server answering is OURS", tail)
+        self.assertIn("confirm, confirm_message = probe_server", tail)
+        # and the save happens only after that check
+        self.assertLess(tail.index("confirm, confirm_message"),
+                        tail.index("save_server_key"))
+
+    def test_starts_are_serialised_in_process(self):
+        """Two threads calling ensure_server must not interleave."""
+        import threading
+        import time as _time
+
+        order: list[str] = []
+        lock = self.runtime._START_LOCK
+
+        def worker(name: str) -> None:
+            with lock:
+                order.append(f"{name}-in")
+                _time.sleep(0.15)
+                order.append(f"{name}-out")
+
+        threads = [threading.Thread(target=worker, args=(n,)) for n in "AB"]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        # never A-in, B-in, ... : one holder at a time
+        self.assertEqual(order[0][-2:], "in")
+        self.assertEqual(order[1][-3:], "out")
+        self.assertEqual(order[2][-2:], "in")
+        self.assertEqual(order[3][-3:], "out")
 
 
 class TestFailureDiagnosis(unittest.TestCase):

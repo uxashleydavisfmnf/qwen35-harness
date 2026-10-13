@@ -20,6 +20,7 @@ import os
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -29,6 +30,12 @@ from pathlib import Path
 from typing import Any, Callable
 
 from .config import ModelProfile
+
+#: Serialises server starts *within this process*.  Concurrent starts are the
+#: root cause of the "server is running but does not accept the stored API key"
+#: state: the loser of the port race cannot bind, its wait_ready is satisfied by
+#: the winner's /health, and it then saves a key the live server has never seen.
+_START_LOCK = threading.Lock()
 
 __all__ = [
     "runtime_dir",
@@ -608,6 +615,63 @@ class ServerStatus:
         return self.server is not None
 
 
+def stop_servers_on_port(host: str = "127.0.0.1", port: int = 8080) -> int:
+    """Kill whatever llama-server owns the port.  Returns how many were stopped.
+
+    Used only when the caller has explicitly asked to take the port back.  The
+    pid is taken from the socket rather than from ``server.json``, because the
+    recorded pid is exactly what has gone stale when this is needed.
+    """
+    pids: set[int] = set()
+    try:
+        import subprocess as _sp
+
+        out = _sp.run(["netstat", "-ano", "-p", "TCP"], capture_output=True,
+                      text=True, timeout=15, encoding="utf-8", errors="replace")
+        for line in (out.stdout or "").splitlines():
+            parts = line.split()
+            if len(parts) >= 5 and parts[0].upper() == "TCP" and \
+                    parts[3].upper() == "LISTENING" and \
+                    parts[1].endswith(f":{port}"):
+                try:
+                    pids.add(int(parts[4]))
+                except ValueError:
+                    pass
+    except Exception:  # noqa: BLE001 - fall through to the name-based sweep
+        pass
+
+    stopped = 0
+    for pid in pids:
+        try:
+            check = subprocess.run(
+                ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
+                capture_output=True, text=True, timeout=15,
+                encoding="utf-8", errors="replace")
+            if "llama-server" not in (check.stdout or "").lower():
+                continue          # not ours; never kill an unrelated process
+            subprocess.run(["taskkill", "/F", "/PID", str(pid)],
+                           capture_output=True, timeout=15)
+            stopped += 1
+        except Exception:  # noqa: BLE001
+            continue
+
+    if not stopped:
+        # Nothing identifiable owned the port by pid; fall back to the documented
+        # sweep, which is also what stop.bat does.
+        try:
+            probe = subprocess.run(["tasklist", "/FI", "IMAGENAME eq llama-server.exe",
+                                    "/FO", "CSV", "/NH"], capture_output=True,
+                                   text=True, timeout=15, encoding="utf-8",
+                                   errors="replace")
+            if "llama-server" in (probe.stdout or "").lower():
+                subprocess.run(["taskkill", "/F", "/IM", "llama-server.exe"],
+                               capture_output=True, timeout=20)
+                stopped = (probe.stdout or "").lower().count("llama-server")
+        except Exception:  # noqa: BLE001
+            pass
+    return stopped
+
+
 def ensure_server(
     *,
     model_dir: str | os.PathLike[str],
@@ -621,6 +685,7 @@ def ensure_server(
     threads: int | None = None,
     ctx_checkpoints: int = 16,
     checkpoint_min_step: int = 512,
+    force_restart: bool = False,
     timeout: float = 300.0,
     state_dir: str | os.PathLike[str] | None = None,
     progress: Any = None,
@@ -629,32 +694,86 @@ def ensure_server(
 
     This is the one place server lifecycle is decided, so the CLI, the GUI and
     any future front end behave identically.
+
+    ``force_restart=True`` means "if something unusable already holds the port,
+    stop it and take the port back".
     """
+    # Serialise starts inside this process.  Two clicks on 重启服务 used to
+    # launch two starts at once; the loser could not bind, but wait_ready was
+    # satisfied by the *winner's* /health, so it saved its own key and the
+    # running server ended up with a key nobody had.  The symptom was exactly
+    # "a server is running but does not accept the stored API key".
+    with _START_LOCK:
+        return _ensure_server_locked(
+            model_dir=model_dir, context=context, port=port, host=host,
+            gguf=gguf, mmproj=mmproj, kv_cache_type=kv_cache_type, mtp=mtp,
+            threads=threads, ctx_checkpoints=ctx_checkpoints,
+            checkpoint_min_step=checkpoint_min_step,
+            force_restart=force_restart, timeout=timeout, state_dir=state_dir,
+            progress=progress)
+
+
+def _ensure_server_locked(
+    *,
+    model_dir: str | os.PathLike[str],
+    context: int = 32768,
+    port: int = 8080,
+    host: str = "127.0.0.1",
+    gguf: str | os.PathLike[str] | None = None,
+    mmproj: str | os.PathLike[str] | None = None,
+    kv_cache_type: str = "q8_0",
+    mtp: bool = False,
+    threads: int | None = None,
+    ctx_checkpoints: int = 16,
+    checkpoint_min_step: int = 512,
+    force_restart: bool = False,
+    timeout: float = 300.0,
+    state_dir: str | os.PathLike[str] | None = None,
+    progress: Any = None,
+) -> ServerStatus:
     base_url = f"http://{host}:{port}"
     api_key = load_server_key()
 
     state, message = probe_server(base_url, api_key)
     if state == "up":
         return ServerStatus(True, "reused", message, base_url, api_key)
-    if state == "unauthorized":
-        return ServerStatus(
-            False, "failed",
-            f"{message}. Stop it (stop.bat, or taskkill /IM llama-server.exe) "
-            "and try again.",
-            base_url, "",
-        )
-    if port_in_use(host, port):
-        # Never race a server we cannot talk to: starting a second one would
-        # leave an orphan that cannot bind, and its key would overwrite the
-        # working one.
-        return ServerStatus(
-            False, "failed",
-            f"port {host}:{port} is already in use, but the server there did not "
-            f"answer the health check ({message}). It is most likely a "
-            "llama-server left over from an earlier run. Close it (stop.bat, or "
-            "taskkill /IM llama-server.exe) and try again.",
-            base_url, "",
-        )
+
+    if state == "unauthorized" or port_in_use(host, port):
+        # Something is on the port and we cannot use it: either it rejects the
+        # stored key, or it does not answer the health check at all.
+        detail = (message if state == "unauthorized"
+                  else f"it did not answer the health check ({message})")
+        if not force_restart:
+            return ServerStatus(
+                False, "failed",
+                f"{detail}. It is most likely a llama-server left over from an "
+                "earlier run. Stop it (stop.bat, or taskkill /IM "
+                "llama-server.exe) and try again -- or let the harness do it "
+                "for you (the GUI offers this, the CLI takes --force-restart).",
+                base_url, "",
+            )
+        if progress:
+            progress("stopping the server that holds the port")
+        killed = stop_servers_on_port(host, port)
+        if not killed:
+            return ServerStatus(
+                False, "failed",
+                f"{detail}, and it could not be stopped automatically. "
+                "Run stop.bat, then try again.",
+                base_url, "",
+            )
+        # give the socket a moment to be released before rebinding
+        for _ in range(20):
+            if not port_in_use(host, port):
+                break
+            time.sleep(0.25)
+        if port_in_use(host, port):
+            return ServerStatus(
+                False, "failed",
+                f"stopped {killed} process(es) but {host}:{port} is still "
+                "occupied. Something else is holding it.",
+                base_url, "",
+            )
 
     server_bin = installed_server()
     if server_bin is None:
@@ -701,8 +820,24 @@ def ensure_server(
         server.stop()
         return ServerStatus(False, "failed", msg, base_url, "")
 
-    # Belt and braces: /health is answered by whoever owns the port.  Confirm our
-    # own child is still alive before claiming ownership of it.
+    # --- prove the server answering is OURS --------------------------------
+    # /health is answered by whoever owns the port, so "ready" only proves that
+    # *some* server is up.  Ask it to authenticate with the key we just handed
+    # our own child: a foreign server has never seen that key and will refuse.
+    # Without this check the harness saved a key the live server did not have,
+    # and every later run failed with "does not accept the stored API key".
+    confirm, confirm_message = probe_server(base_url, api_key, timeout=15.0)
+    if confirm != "up":
+        server.stop()
+        return ServerStatus(
+            False, "failed",
+            f"another server is holding {host}:{port} ({confirm_message}). It "
+            "was not started by this window and does not accept this key. Use "
+            "--force-restart / the GUI's restart offer to take the port back.",
+            base_url, "",
+        )
+
+    # Belt and braces: confirm our own child is still alive before claiming it.
     if server.proc is not None and server.proc.poll() is not None:
         return ServerStatus(
             False, "failed",

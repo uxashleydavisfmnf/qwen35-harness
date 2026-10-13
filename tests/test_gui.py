@@ -827,13 +827,13 @@ class TestStaleServerStatus(SharedTkRoot, unittest.TestCase):
             time.sleep(0.05)
         return False
 
-    def _capture_dialogs(self) -> list[tuple[str, str]]:
+    def _capture_dialogs(self, *, answer_yes: bool = False) -> list[tuple[str, str]]:
         import tkinter.messagebox as messagebox
 
         seen: list[tuple[str, str]] = []
         originals = (messagebox.askyesno, messagebox.showwarning,
                      messagebox.showerror)
-        messagebox.askyesno = lambda t, m, **k: (seen.append((t, m)), False)[1]
+        messagebox.askyesno = lambda t, m, **k: (seen.append((t, m)), answer_yes)[1]
         messagebox.showwarning = lambda t, m, **k: seen.append((t, m))
         messagebox.showerror = lambda t, m, **k: seen.append((t, m))
         self.addCleanup(lambda: (
@@ -875,21 +875,32 @@ class TestStaleServerStatus(SharedTkRoot, unittest.TestCase):
         self.assertFalse(self.gui._busy, "the window must not stay busy")
 
     def test_a_conflicting_server_is_reported_as_such(self):
-        """A server that answers but rejects the key is a different problem."""
+        """A server that answers but rejects the key is a different problem.
+
+        And it must offer the fix rather than telling the user to go and run
+        taskkill themselves: the harness owns this lifecycle.
+        """
         original = self.gui._probe_server
         self.gui._probe_server = lambda: (
             "unauthorized", "a server is running but does not accept the key")
-        seen = self._capture_dialogs()
+        seen = self._capture_dialogs(answer_yes=True)
+        restarted: list[bool] = []
+        original_start = self.gui._start_server_async
+        self.gui._start_server_async = lambda force=False: restarted.append(force)
         try:
             self.gui._act_bench()
             self.assertTrue(self._pump_until(
                 lambda: "不接受已保存的密钥"
                 in self.gui.transcript.get("1.0", "end")))
-            body = self.gui.transcript.get("1.0", "end")
-            self.assertIn("stop.bat", body)
+            self.assertTrue(seen, "the user was not told about the conflict")
+            # the dialog offers to take the port back, and answering yes does it
+            self.assertTrue(restarted, "no forced restart was offered")
+            self.assertEqual(restarted[0], True, "the restart must be forced")
             self.assertFalse(self.gui._bench_running)
+            self.assertIsNone(self.gui.server_status)
         finally:
             self.gui._probe_server = original
+            self.gui._start_server_async = original_start
 
 
 if __name__ == "__main__":
