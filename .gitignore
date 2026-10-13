@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+.pyright/
+.mypy_cache/
+
+# The harness's own runtime state.  Never commit this: it holds the
+# llama-server API key (state/server.json), session transcripts, attachment
+# conversions and workspace-installed packages.
+.qwen35/
+state/
+sessions/
+*.jsonl
+
+# Models and the llama.cpp runtime are large binaries fetched by
+# `qwen35 fetch` / `qwen35 install-runtime`; they do not belong in git.
+models/
+runtime/
+*.gguf
+
+# Editors / OS
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+desktop.ini

@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "qwen35-harness"
+version = "1.0.0"
+description = "A lightweight, sandboxed agent harness built specifically for Qwen3.5-0.8B (vision, 262K context, hybrid Gated-DeltaNet attention)."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+keywords = ["llm", "agent", "harness", "qwen", "llama.cpp", "grammar", "sandbox"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+# The core harness is standard library only.  Everything here is optional and
+# only needed for a specific backend or feature.
+dependencies = []
+
+[project.optional-dependencies]
+# in-process inference without a separate server
+transformers = ["torch>=2.2", "transformers>=4.57", "pillow>=10"]
+# only needed for YAML syntax validation
+yaml = ["pyyaml>=6"]
+dev = ["pyright>=1.1"]
+
+[project.scripts]
+qwen35 = "qwen35.cli:main"
+
+[tool.setuptools]
+packages = ["qwen35", "qwen35.backends"]
+
+[tool.pyright]
+include = ["qwen35"]
+pythonVersion = "3.11"
+typeCheckingMode = "standard"
