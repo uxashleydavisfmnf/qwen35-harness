@@ -552,6 +552,65 @@ class TestGuiAttachments(SharedTkRoot, unittest.TestCase):
     def test_register_dnd_does_not_raise(self):
         # returns True with tkinterdnd2, False without; either way it must work
         self.assertIn(self.gui.register_dnd(), (True, False))
+
+    def test_clear_starts_a_new_conversation(self):
+        """清空 must reset everything, not just the transcript text.
+
+        It used to wipe the text and leave the attachments attached, so the next
+        message still carried the files from the conversation the user believed
+        they had just ended.
+        """
+        import tkinter.messagebox as messagebox
+
+        from PIL import Image
+
+        original = messagebox.askyesno
+        messagebox.askyesno = lambda *a, **k: True       # auto-confirm
+        try:
+            note = self._make_file("note.txt", "hello from a file\n")
+            picture = Path(self._tmp.name).parent / "qwen-clear-pic.png"
+            Image.new("RGB", (24, 24), "red").save(picture)
+            self.addCleanup(lambda: picture.unlink(missing_ok=True))
+            self.gui._add_files([str(note), str(picture)])
+            self.assertTrue(self._drain_until(
+                lambda: len(self.gui.attachments) == 2), "attachments missing")
+
+            store = Path(self._tmp.name) / ".qwen35" / "attachments"
+            self.assertTrue([p for p in store.rglob("*") if p.is_file()])
+
+            self.gui._clear()
+
+            self.assertEqual(self.gui.attachments, [])
+            self.assertEqual(self.gui._pending_paths, [])
+            self.assertIsNone(self.gui._last_stats)
+            self.assertFalse([p for p in store.rglob("*") if p.is_file()],
+                             "converted copies should not be left behind")
+            body = self.gui.transcript.get("1.0", "end")
+            self.assertEqual(body.count("qwen35 harness"), 1,
+                             "the banner should be reprinted exactly once")
+            # the user's own files are never touched
+            self.assertTrue(note.is_file())
+            self.assertTrue(picture.is_file())
+        finally:
+            messagebox.askyesno = original
+
+    def test_clear_is_refused_while_a_task_is_running(self):
+        import tkinter.messagebox as messagebox
+
+        seen: list[str] = []
+        original_warn = messagebox.showwarning
+        original_ask = messagebox.askyesno
+        messagebox.showwarning = lambda title, msg, **k: seen.append(title)
+        messagebox.askyesno = lambda *a, **k: True
+        try:
+            self.gui._busy = True
+            self.gui._clear()
+            self.assertTrue(seen, "a running task must block the reset")
+        finally:
+            messagebox.showwarning = original_warn
+            messagebox.askyesno = original_ask
+            self.gui._busy = False
+
     # -- composing the task -------------------------------------------
     def test_compose_task_without_attachments_is_unchanged(self):
         self.assertEqual(self.gui._compose_task("do the thing"), "do the thing")

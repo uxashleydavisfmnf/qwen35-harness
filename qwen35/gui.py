@@ -349,7 +349,11 @@ class HarnessGUI:
         self.stop_button = ttk.Button(bottom, text="停止", width=13,
                                       command=self._on_stop, state="disabled")
         bottom.add(self.stop_button)
-        bottom.add(ttk.Button(bottom, text="清空", width=13, command=self._clear))
+        clear_button = ttk.Button(bottom, text="清空", width=13,
+                                  command=self._clear)
+        bottom.add(clear_button)
+        _tip(clear_button, "开新对话：清空窗口内容、附件和上一次的运行统计。"
+                           "工作区里的文件不会动。")
         bottom.add(ttk.Button(bottom, text="打开工作区", width=13,
                               command=self._open_workspace))
 
@@ -359,14 +363,7 @@ class HarnessGUI:
                            style="Muted.TLabel")
         status.pack(fill="x", padx=14, pady=(0, 10))
 
-        self._append("qwen35 harness — Qwen3.5-0.8B\n", "head")
-        self._append(f"工作区  {self.workspace}\n", "meta")
-        self._append(f"模型    {self.model_dir}\n", "meta")
-        self._append("提示：Enter 发送，Shift+Enter 换行。"
-                     "模型只能在工作区内读写，盘符根目录会被拒绝。\n\n", "meta")
-        notice = getattr(self, "_pending_notice", "")
-        if notice:
-            self._append(notice + "\n\n", "warn")
+        self._banner()
         self.input.focus_set()
 
         # Lay the wrapping rows out once the window has a real width.  A
@@ -1062,10 +1059,100 @@ class HarnessGUI:
             self.status_var.set("已请求停止；当前这一步结束后停止")
 
     def _clear(self) -> None:
+        """Start a new conversation.
+
+        This used to wipe the transcript text and nothing else, which was
+        misleading: the attachments stayed attached, so the *next* message still
+        carried the files from the conversation the user thought they had just
+        ended.  "New conversation" now means all of it -- transcript, banner,
+        attachments, image preview and the previous run's accounting.
+        """
+        if self._busy:
+            messagebox.showwarning(
+                "任务正在运行",
+                "先点「停止」，等这一步结束再开新对话。")
+            return
+        has_content = bool(self.transcript.get("1.0", "end").strip())
+        has_files = bool(self.attachments)
+        if (has_content or has_files) and not messagebox.askyesno(
+                "开始新对话",
+                "会清空窗口内容、附件列表和上一次的运行统计。\n"
+                "工作区里的文件不会被动。\n\n确定吗？"):
+            return
+
         self.transcript.configure(state="normal")
         self.transcript.delete("1.0", "end")
         self.transcript.configure(state="disabled")
+
+        # attachments: the list, and the converted copies this conversation
+        # produced.  They are derived data -- re-dropping the file regenerates
+        # them -- so leaving them behind would just accumulate in .qwen35/.
+        removed = self._remove_ingested_files()
+        self._pending_paths = []
+        self.attachments = []
+        self._refresh_attachments()
         self._set_image(None)
+        self._last_stats = None
+        self.status_var.set("新对话" + (f"（清理了 {removed} 个转换文件）"
+                                       if removed else ""))
+        self._banner()
+
+    def _remove_ingested_files(self) -> int:
+        """Delete the converted copies for the current attachments.
+
+        Only what *this* conversation ingested, and only inside the workspace's
+        own ``.qwen35/attachments`` directory: the originals the user dragged in
+        are never touched.  Session transcripts are kept -- they are the record.
+        """
+        folder = Path(self.workspace) / ".qwen35" / "attachments"
+        if not folder.is_dir():
+            return 0
+        removed = 0
+        for attachment in self.attachments:
+            targets: list[Path] = []
+            if attachment.out_rel:
+                targets.append(Path(self.workspace) / attachment.out_rel)
+            for image in attachment.images:
+                targets.append(Path(self.workspace) / image)
+            for target in targets:
+                try:
+                    resolved = target.resolve()
+                    resolved.relative_to(folder.resolve())
+                except (OSError, ValueError):
+                    continue          # never delete outside the attachment store
+                if resolved.is_file():
+                    try:
+                        resolved.unlink()
+                        removed += 1
+                    except OSError:
+                        pass
+        # the per-attachment page folders (scanned PDFs) go too
+        for child in folder.iterdir():
+            if child.is_dir() and not any(child.iterdir()):
+                try:
+                    child.rmdir()
+                except OSError:
+                    pass
+        return removed
+
+    def _banner(self) -> None:
+        """The greeting at the top of a fresh conversation."""
+        self._append("qwen35 harness — Qwen3.5-0.8B\n", "head")
+        self._append(f"工作区  {self.workspace}\n", "meta")
+        self._append(f"模型    {self.model_dir}\n", "meta")
+        self._append("提示：Enter 发送，Shift+Enter 换行。"
+                     "模型只能在工作区内读写，盘符根目录会被拒绝。\n"
+                     "「清空」= 开新对话：窗口、附件、运行统计一起重置。\n\n",
+                     "meta")
+        notice = getattr(self, "_pending_notice", "")
+        if notice:
+            self._append(notice + "\n\n", "warn")
+        self.input.focus_set()
+
+    def _clear_attachments(self) -> None:
+        self._pending_paths = []
+        self.attachments = []
+        self._refresh_attachments()
 
     def _set_busy(self, busy: bool) -> None:
         self._busy = busy
