@@ -870,19 +870,70 @@ class HarnessGUI:
             f"运行一次。\n  在终端执行 `start.bat -Action watch` 开始定时工作。\n",
             "ok")
 
+    def _probe_server(self) -> tuple[bool, str]:
+        """Ask the server whether it is actually there, right now.
+
+        The cached ``server_status`` is not enough.  It records what was true when
+        the server was started, and a llama-server can be stopped from outside the
+        window -- by ``stop.bat``, by a reboot, by anything.  Trusting the cache
+        produced exactly the failure this method exists to prevent:
+
+            性能实测失败：the model server is not answering at
+            http://127.0.0.1:8080 (<urlopen error [WinError 10061] ...>)
+
+        which reported a *connection* error for what was really a stale label.
+        A short timeout keeps this cheap on the UI thread.
+        """
+        from .llama_runtime import probe_server
+
+        try:
+            return probe_server(self._base_url(), load_server_key(), timeout=3.0)
+        except Exception as exc:  # noqa: BLE001 - diagnostics only
+            return "down", f"{type(exc).__name__}: {exc}"
+
+    def _mark_server_down(self) -> None:
+        self.server_status = None
+        try:
+            self.server_label.configure(text="服务：未运行")
+        except tk.TclError:
+            pass
+
+    def _offer_restart(self, what: str, message: str) -> None:
+        """Explain that the server is gone, and offer to bring it back."""
+        self._mark_server_down()
+        self._append(f"  模型服务没有在运行：{message}\n", "warn")
+        self._append("  点右上角「重启服务」可以拉起来（首次约 20 秒）。\n", "meta")
+        if messagebox.askyesno(
+                "模型服务未运行",
+                f"{what}需要模型服务，但现在连不上 {self._base_url()}。\n\n"
+                f"{message}\n\n现在启动吗？（首次约 20 秒）"):
+            self._start_server_async()
+
     def _act_bench(self) -> None:
         """Measure prefill / cache / generation on the running server."""
         self._act_head("性能实测")
-        if not (self.server_status and self.server_status.ok):
-            self._append("  模型服务未就绪，先点右上角「重启服务」。\n", "warn")
-            return
         if getattr(self, "_bench_running", False):
+            self._append("  上一次实测还在进行中。\n", "warn")
             return
         self._bench_running = True
-        self._append("  正在测量（冷预填充 + 前缀缓存 + 生成，约 1 分钟）…\n", "meta")
+        self._append("  检查模型服务…\n", "meta")
 
         def worker() -> None:
             try:
+                state, message = self._probe_server()
+                # NOTE: compare against "up".  probe_server returns a (state,
+                # message) tuple, and an earlier version of this fix wrote
+                # `if not up:` -- but `up` is the *string* "down", which is
+                # truthy, so every dead server was treated as healthy.
+                if state == "unauthorized":
+                    self.events.put(("server_conflict", message, None))
+                    return
+                if state != "up":
+                    self.events.put(("server_down", ("性能实测", message), None))
+                    return
+                self.events.put(("bench_note",
+                                 "  正在测量（冷预填充 + 前缀缓存 + 生成，"
+                                 "约 1 分钟）…\n", None))
                 from .bench import run_bench
 
                 report = run_bench(base_url=self._base_url(), grow_steps=4,
@@ -1033,6 +1084,18 @@ class HarnessGUI:
         try:
             from .backends import build_backend
             from .loop import Agent
+
+            # Probe first, for the same reason the bench does: a cached "ready"
+            # goes stale the moment the server is stopped from outside, and the
+            # run would then die with an opaque connection error instead of
+            # "the server is not running, shall I start it?".
+            state, message = self._probe_server()
+            if state == "unauthorized":
+                self.events.put(("server_conflict", message, None))
+                return
+            if state != "up":
+                self.events.put(("server_down", ("运行任务", message), None))
+                return
 
             cfg = self._make_config(options)
             backend = build_backend(cfg.runtime)
@@ -1190,6 +1253,24 @@ class HarnessGUI:
                     self._on_attachments(a)
                 elif kind == "bench":
                     self._on_bench(a)
+                elif kind == "bench_note":
+                    self._append(a, "meta")
+                elif kind == "server_down":
+                    self._bench_running = False
+                    self._set_busy(False)
+                    self.agent = None
+                    self._offer_restart(*a)
+                elif kind == "server_conflict":
+                    self._bench_running = False
+                    self._set_busy(False)
+                    self.agent = None
+                    self._mark_server_down()
+                    self._append(f"  端口上有一个服务，但不接受已保存的密钥：{a}\n",
+                                 "warn")
+                    self._append(
+                        "  这通常是上一次运行留下的 llama-server。先运行 "
+                        "stop.bat（或 taskkill /IM llama-server.exe）把它停掉，"
+                        "再点「重启服务」。\n", "meta")
                 elif kind == "bench_error":
                     self._bench_running = False
                     self._append(f"\n性能实测失败：{a}\n", "err")

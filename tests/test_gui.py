@@ -774,5 +774,123 @@ class TestAdaptiveLayout(SharedTkRoot, unittest.TestCase):
                            f"expected the bottom row to wrap when narrow, got {narrow}")
 
 
+@unittest.skipUnless(TK_OK, SKIP_REASON)
+class TestStaleServerStatus(SharedTkRoot, unittest.TestCase):
+    """A cached "ready" must not be trusted.
+
+    Reported from a real session, after the server had been stopped from outside
+    the window:
+
+        性能实测失败：the model server is not answering at http://127.0.0.1:8080
+        (<urlopen error [WinError 10061] ...>)
+
+    The label said ready, so the bench went straight to the network and reported
+    a *connection* error.  The fix probes for real first and then says what is
+    actually wrong.
+    """
+
+    def setUp(self):
+        from qwen35.gui import HarnessGUI
+        from qwen35.llama_runtime import ServerStatus
+
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = self.fresh_root()
+        self.root.withdraw()
+        self.gui = HarnessGUI(
+            self.root, workspace=Path(self._tmp.name), model_dir=Path(self._tmp.name),
+            auto_start_server=False, manage_server=False,
+        )
+        self.ServerStatus = ServerStatus
+        # a port with nothing behind it: bound, then closed
+        import socket
+
+        probe = socket.socket()
+        probe.bind(("127.0.0.1", 0))
+        self.dead_port = probe.getsockname()[1]
+        probe.close()
+        self.dead_url = f"http://127.0.0.1:{self.dead_port}"
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _stale_status(self):
+        self.gui.server_status = self.ServerStatus(
+            True, "started", "server ready", self.dead_url, "key")
+
+    def _pump_until(self, predicate, timeout: float = 40.0) -> bool:
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            self.gui._drain()
+            self.root.update()
+            if predicate():
+                return True
+            time.sleep(0.05)
+        return False
+
+    def _capture_dialogs(self) -> list[tuple[str, str]]:
+        import tkinter.messagebox as messagebox
+
+        seen: list[tuple[str, str]] = []
+        originals = (messagebox.askyesno, messagebox.showwarning,
+                     messagebox.showerror)
+        messagebox.askyesno = lambda t, m, **k: (seen.append((t, m)), False)[1]
+        messagebox.showwarning = lambda t, m, **k: seen.append((t, m))
+        messagebox.showerror = lambda t, m, **k: seen.append((t, m))
+        self.addCleanup(lambda: (
+            setattr(messagebox, "askyesno", originals[0]),
+            setattr(messagebox, "showwarning", originals[1]),
+            setattr(messagebox, "showerror", originals[2])))
+        return seen
+
+    def test_the_probe_reports_a_dead_server(self):
+        state, _message = self.gui._probe_server()
+        self.assertNotEqual(state, "up",
+                            "nothing is listening, so the probe must not say up")
+
+    def test_bench_detects_a_dead_server_despite_a_ready_cached_status(self):
+        seen = self._capture_dialogs()
+        self._stale_status()
+        self.gui._act_bench()
+        self.assertTrue(self._pump_until(lambda: bool(seen)),
+                        "no dialog was raised for a server that is gone")
+        body = self.gui.transcript.get("1.0", "end")
+        self.assertIn("模型服务没有在运行", body)
+        self.assertIn("重启服务", body)
+        # the stale label is corrected, and the bench does not stay "running"
+        self.assertIsNone(self.gui.server_status)
+        self.assertFalse(self.gui._bench_running)
+        # and it never claimed to be measuring
+        self.assertNotIn("正在测量", body)
+
+    def test_sending_a_task_also_detects_a_dead_server(self):
+        seen = self._capture_dialogs()
+        self._stale_status()
+        self.gui.input.insert("1.0", "hello")
+        self.gui._on_send()
+        self.assertTrue(self._pump_until(lambda: bool(seen)),
+                        "no dialog was raised when the server was gone")
+        body = self.gui.transcript.get("1.0", "end")
+        self.assertIn("运行任务需要模型服务", " ".join(
+            m for _t, m in seen) + body)
+        self.assertFalse(self.gui._busy, "the window must not stay busy")
+
+    def test_a_conflicting_server_is_reported_as_such(self):
+        """A server that answers but rejects the key is a different problem."""
+        original = self.gui._probe_server
+        self.gui._probe_server = lambda: (
+            "unauthorized", "a server is running but does not accept the key")
+        seen = self._capture_dialogs()
+        try:
+            self.gui._act_bench()
+            self.assertTrue(self._pump_until(
+                lambda: "不接受已保存的密钥"
+                in self.gui.transcript.get("1.0", "end")))
+            body = self.gui.transcript.get("1.0", "end")
+            self.assertIn("stop.bat", body)
+            self.assertFalse(self.gui._bench_running)
+        finally:
+            self.gui._probe_server = original
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

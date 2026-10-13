@@ -30,3 +30,8 @@ runtime/
 *.swp
 Thumbs.db
 desktop.ini
+
+# Scratch files used to pass a commit message to git without fighting the
+# shell's quoting rules.  Never part of the project.
+MSG.txt
+COMMIT_MSG.txt
